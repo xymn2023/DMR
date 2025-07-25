@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- DMR - Docker 项目备份与恢复工具 ---
-# 版本: 2.20 (重要更新: 修复不能多服务同时进行备份；修复 'local: can only be used in a function' 错误；修复 `docker inspect` 生成 `docker run` 命令时的 `sed` 和模板解析错误，提高健壮性；首次运行自动提示注册为全局dmr命令；菜单中添加“0. 返回”选项；依赖自动安装；日志目录创建顺序；备份时容器识别逻辑；优化: 服务列表只显示运行中容器；强化名称提取；完整中文本地化；支持空格分隔多服务批量备份；修复绑定挂载名称解析)
+# 版本: 2.27 (重要更新: 彻底修复备份时的交互式多服务添加逻辑，确保 'y' 继续添加，'n' 停止并确认备份，'0' 返回主菜单；修复批量备份时，输入多个ID/名称无法正确分割并逐一处理的问题，确保 `backup_project` 每次只处理一个标识符；修复 `docker inspect` 生成 `docker run` 命令时的 `sed` 和模板解析错误，提高健壮性；首次运行自动提示注册为全局dmr命令；菜单中添加“0. 返回”选项；依赖自动安装；日志目录创建顺序；备份时容器识别逻辑；优化: 服务列表只显示运行中容器；强化名称提取；完整中文本地化；修复绑定挂载名称解析)
 # 作者: AI 您的AI助手
 # 描述: 此脚本提供交互式菜单，用于备份和恢复 Docker 容器及其相关数据。
 
@@ -145,7 +145,13 @@ get_container_details() {
         log_info "容器 ${container_name} 是一个独立容器。"
         # 尝试生成 docker run 命令
         # 改进：更安全地提取 Cmd 字段，并确保其为字符串格式
-        local cmd_args=$(docker inspect --format '{{json .Config.Cmd}}' "$container_id" 2>/dev/null | jq -r 'if type == "array" then .[] | @sh else . end' | tr '\n' ' ')
+        # 使用 jq 过滤，避免因为 Cmd 字段可能为空或非数组导致的模板错误
+        local cmd_json=$(docker inspect --format '{{json .Config.Cmd}}' "$container_id" 2>/dev/null)
+        local cmd_args=""
+        if [ -n "$cmd_json" ]; then
+            # 尝试将 Cmd 字段解析为数组并转换为shell安全字符串，然后合并
+            cmd_args=$(echo "$cmd_json" | jq -r 'if type == "array" then .[] | @sh else . end' 2>/dev/null | tr '\n' ' ')
+        fi
         
         # 简化 docker run 命令生成，避免复杂 sed 替换
         run_command="docker run "
@@ -187,7 +193,7 @@ get_container_details() {
 
 # 主备份功能
 backup_project() {
-    local project_identifier="$1" # 可以是镜像名称或容器 ID/名称
+    local project_identifier="$1" # 只能是单个镜像名称或容器 ID/名称
     local container_ids=()
     local inferred_project_name="" # 用于最终文件名的项目名称部分，初始为空
     local backup_timestamp=$(date +%Y%m%d_%H%M%S) # 为当前备份生成时间戳
@@ -195,7 +201,8 @@ backup_project() {
     
     # 每次备份时生成一个唯一的临时文件路径，确保在函数内部清理
     # 使用随机字符串防止多进程冲突，并加入时间戳
-    TMP_DETAILS_FILE="${BACKUP_BASE_DIR}/temp_details_${DATE_FORMAT}_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 8).conf"
+    # 确保 TMP_DETAILS_FILE 在此函数内声明，避免全局污染和意想不到的错误
+    local TMP_DETAILS_FILE="${BACKUP_BASE_DIR}/temp_details_${DATE_FORMAT}_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 8).conf"
     
     log_info "正在尝试备份 Docker 项目/容器: ${project_identifier}"
 
@@ -298,7 +305,7 @@ backup_project() {
     mkdir -p "${backup_folder}" || log_error "无法创建临时备份目录: ${backup_folder}"
 
     # 再次确认 TMP_DETAILS_FILE 设置在临时备份文件夹内
-    TMP_DETAILS_FILE="${backup_folder}/project_details.conf"
+    # TMP_DETAILS_FILE 已在函数顶部声明为 local
     echo "BACKUP_DATE=${backup_timestamp}" >> "${TMP_DETAILS_FILE}"
 
     local compose_file_path=""
@@ -380,6 +387,7 @@ backup_project() {
     rm -rf "${backup_folder}" || log_warn "无法删除临时备份目录: ${backup_folder}。可能需要手动清理。"
     rm -f "${TMP_DETAILS_FILE}" 2>/dev/null # 确保临时文件也被清理
     echo "" # 添加空行以提高可读性
+    return 0 # 成功返回 0
 }
 
 # --- 恢复功能 ---
@@ -639,7 +647,7 @@ self_register_as_global_command() {
             read -r -e -p "按回车键继续..."
         else
             log_error "注册全局命令失败。请检查权限或手动将脚本复制到 '/usr/local/bin' 并重命名为 '${GLOBAL_COMMAND_NAME}'。"
-            log_warn "您仍然可以继续使用当前脚本文件运行 DMR。"
+            log_warn "您仍然可以使用当前脚本文件运行 DMR。"
             read -r -e -p "按回车键继续..."
         fi
     else
@@ -678,60 +686,111 @@ while true; do
     echo "" # 空行用于间距
 
     case "$choice" in
-        1) # 备份 Docker 服务
+        1) # 备份 Docker 服务 (交互式多服务添加)
             log_info "--- 备份 Docker 服务 ---"
-            # 每次进入此选项都重新列出服务，确保实时性
-            if ! list_docker_services; then
-                # 如果没有正在运行的服务，此处不直接返回主菜单，允许用户手动输入
-                log_warn "没有正在运行的 Docker 服务列出。您仍然可以手动输入容器 ID/名称或镜像名称进行备份。"
-            fi
-            echo ""
-            echo -e "${YELLOW}0. 返回主菜单${NC}"
-            echo -e "${BLUE}提示：您可以输入一个或多个服务标识符，用空格 ' ' 分隔进行批量备份。${NC}"
-            read -r -e -p "请输入要备份的 Docker 镜像名称或容器 ID/名称 (例如: 'nginx:latest my_app_container'): " service_identifiers_input
-            
-            if [ "$service_identifiers_input" == "0" ]; then
-                log_info "返回主菜单。"
-                continue
-            fi
-            if [ -z "$service_identifiers_input" ]; then
-                log_warn "未提供服务标识符。返回主菜单。"
-                continue
-            fi
+            local services_to_backup=() # 初始化空数组
+            local continue_add_loop_flag=true # 循环标志
 
-            # **修复：将 services_to_backup 声明为局部变量提升到函数开始，或者移除这里的local**
-            # 为了在此作用域中使用，直接赋值即可，无需local
-            IFS=' ' read -ra identifiers_array <<< "$service_identifiers_input"
-            
-            # 声明为局部变量，确保其作用域仅限于此case块
-            local services_to_backup=() 
-            for id_input in "${identifiers_array[@]}"; do
-                # 清理前后空格
-                clean_id=$(echo "$id_input" | xargs)
-                if [ -n "$clean_id" ]; then
-                    services_to_backup+=("$clean_id")
+            while $continue_add_loop_flag; do
+                clear # 每次添加前清屏，保持界面整洁
+                list_docker_services # 每次添加前显示当前运行的服务列表
+
+                echo ""
+                if [ ${#services_to_backup[@]} -eq 0 ]; then
+                    echo -e "${BLUE}当前待备份服务列表: ${YELLOW}无${NC}"
+                else
+                    echo -e "${BLUE}当前待备份服务列表: ${YELLOW}${services_to_backup[*]}${NC}"
                 fi
-            done
+                echo ""
+                echo -e "${YELLOW}提示: 输入 '0' 返回主菜单，输入 'N' 或 'n' 停止添加并开始备份。${NC}"
+                read -r -e -p "请输入要添加备份的 Docker 容器 ID/名称或镜像名称: " single_service_input
 
-            if [ ${#services_to_backup[@]} -eq 0 ]; then
-                log_warn "没有检测到有效的服务标识符。返回主菜单。"
-                continue
-            fi
+                single_service_input=$(echo "$single_service_input" | xargs) # 清理输入
 
-            echo ""
-            echo -e "${BLUE}您选择了以下服务进行备份: ${YELLOW}${services_to_backup[*]}${NC}"
-            read -r -e -p "确认开始备份这些服务吗？(y/N): " confirm_backup
-            if [[ "$confirm_backup" =~ ^[Yy]$ ]]; then
-                for service_id in "${services_to_backup[@]}"; do
-                    log_info "--- 正在备份服务: ${service_id} ---"
-                    backup_project "$service_id" # 调用现有的备份函数
-                    echo "" # 每个服务备份后添加空行
-                done
-                log_success "所有选定服务的批量备份操作已完成。"
-            else
-                log_info "用户取消批量备份。"
+                if [ "$single_service_input" == "0" ]; then
+                    log_info "用户选择返回主菜单。"
+                    continue_add_loop_flag=false # 退出添加循环
+                    choice="0" # 设置主菜单选择为0，以便外部while循环处理
+                    break # 跳出当前添加循环
+                elif [[ "$single_service_input" =~ ^[Nn]$ ]]; then
+                    continue_add_loop_flag=false # 停止添加，进入备份确认流程
+                    break # 跳出当前添加循环
+                elif [ -z "$single_service_input" ]; then
+                    log_warn "输入为空，请重新输入。"
+                    read -r -e -p "按回车键继续..."
+                    continue # 继续当前添加循环，重新提示输入
+                else
+                    # 检查服务是否存在
+                    local temp_ids=()
+                    mapfile -t temp_ids < <(docker ps -a --filter name="^/${single_service_input}$" --format "{{.ID}}")
+                    if [ ${#temp_ids[@]} -eq 0 ]; then
+                        mapfile -t temp_ids < <(docker ps -a --filter id="^${single_service_input}$" --format "{{.ID}}")
+                    fi
+                    if [ ${#temp_ids[@]} -eq 0 ]; then
+                        mapfile -t temp_ids < <(docker ps -aq --filter ancestor="${single_service_input}")
+                    fi
+
+                    if [ ${#temp_ids[@]} -gt 0 ]; then
+                        # 检查是否已存在于列表中，避免重复添加
+                        local already_added=false
+                        for existing_service in "${services_to_backup[@]}"; do
+                            if [ "$existing_service" == "$single_service_input" ]; then
+                                already_added=true
+                                break
+                            fi
+                        done
+
+                        if [ "$already_added" = true ]; then
+                            log_warn "'${single_service_input}' 已在待备份列表中。请勿重复添加。"
+                        else
+                            services_to_backup+=("$single_service_input") # 添加到列表
+                            log_success "'${single_service_input}' 已成功添加到待备份列表。"
+                        fi
+                    else
+                        log_warn "未找到与 '${single_service_input}' 关联的容器。请检查输入。"
+                    fi
+                fi
+                
+                # 无论上次输入结果如何，都询问是否继续添加
+                echo ""
+                echo -e "${BLUE}当前待备份服务列表: ${YELLOW}${services_to_backup[*]:-(无)}${NC}" # 再次显示列表
+                read -r -e -p "是否继续添加其他服务？(Y/n): " continue_add_choice
+                continue_add_choice=$(echo "$continue_add_choice" | tr '[:upper:]' '[:lower:]' | xargs) # 清理并转小写
+
+                if [ "$continue_add_choice" == "n" ]; then
+                    continue_add_loop_flag=false # 停止添加，进入备份确认
+                elif [ "$continue_add_choice" == "0" ]; then
+                    log_info "用户选择返回主菜单。"
+                    continue_add_loop_flag=false # 停止添加循环
+                    choice="0" # 设置主菜单选择为0，以便外部while循环处理
+                fi
+                # 如果是 Y 或空，则 continue_add_loop_flag 仍为 true，循环继续
+            done # End of while loop for adding services
+
+            # 只有当用户没有选择 "0" 返回主菜单时，才执行备份确认
+            if [ "$choice" != "0" ]; then
+                if [ ${#services_to_backup[@]} -eq 0 ]; then
+                    log_info "没有选择任何服务进行备份。返回主菜单。"
+                else
+                    echo ""
+                    echo -e "${BLUE}最终确认待备份服务列表: ${YELLOW}${services_to_backup[*]}${NC}"
+                    read -r -e -p "确认开始备份这些服务吗？(y/N): " confirm_backup
+                    if [[ "$confirm_backup" =~ ^[Yy]$ ]]; then
+                        for service_id in "${services_to_backup[@]}"; do
+                            log_info "--- 正在备份服务: ${service_id} ---"
+                            backup_project "$service_id" 
+                            if [ $? -ne 0 ]; then # 检查 backup_project 的退出状态
+                                log_warn "服务 '${service_id}' 备份失败，但会继续尝试备份其他服务。"
+                            fi
+                            echo "" 
+                        done
+                        log_success "所有选定服务的批量备份操作已尝试完成。"
+                    else
+                        log_info "用户取消批量备份。"
+                    fi
+                fi
+                read -r -e -p "按回车键返回主菜单..."
             fi
-            read -r -e -p "按回车键返回主菜单..."
             ;;
         2) # 恢复 Docker 服务
             log_info "--- 恢复 Docker 服务 ---"
