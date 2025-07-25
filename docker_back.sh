@@ -1,17 +1,19 @@
 #!/bin/bash
 
-# --- Docker 项目备份与恢复脚本 
-# 版本: 2.15 (重要更新: 菜单中添加“0. 返回”选项；依赖自动安装；日志目录创建顺序；备份时容器识别逻辑；优化: 服务列表只显示运行中容器；强化名称提取；完整中文本地化)
+# --- DMR - Docker 项目备份与恢复工具 ---
+# 版本: 2.20 (重要更新: 修复不能多服务同时进行备份；修复 'local: can only be used in a function' 错误；修复 `docker inspect` 生成 `docker run` 命令时的 `sed` 和模板解析错误，提高健壮性；首次运行自动提示注册为全局dmr命令；菜单中添加“0. 返回”选项；依赖自动安装；日志目录创建顺序；备份时容器识别逻辑；优化: 服务列表只显示运行中容器；强化名称提取；完整中文本地化；支持空格分隔多服务批量备份；修复绑定挂载名称解析)
 # 作者: AI 您的AI助手
-# 描述: 此脚本提供交互式菜单，用于备份和恢复 Docker 项目，支持自动服务发现和详细日志记录。
+# 描述: 此脚本提供交互式菜单，用于备份和恢复 Docker 容器及其相关数据。
 
 # --- 配置 ---
 BACKUP_BASE_DIR="/home/docker_backups" # 固定的备份目录
 DATE_FORMAT=$(date +%Y%m%d_%H%M%S)
 BACKUP_FILE_PREFIX="docker_project_backup"
 BACKUP_FILE_EXTENSION=".tar.gz"
-SCRIPT_NAME=$(basename "$0")
+SCRIPT_NAME=$(basename "$0") # 脚本自身的名称，用于判断是否已重命名为 dmr
 LOG_FILE="${BACKUP_BASE_DIR}/docker_backup_restore.log" # 日志文件路径已修改为备份目录下
+GLOBAL_COMMAND_NAME="dmr" # 全局命令的名称
+GLOBAL_COMMAND_PATH="/usr/local/bin/${GLOBAL_COMMAND_NAME}" # 全局命令的目标路径
 
 # --- 颜色输出 ---
 RED='\033[0;31m'
@@ -29,7 +31,14 @@ log_message() {
     local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
     # 确保日志目录存在后再写入日志
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
-    echo -e "${timestamp} [${level}] ${message}" | tee -a "$LOG_FILE"
+    # 根据级别选择颜色输出到控制台，并始终写入文件
+    case "$level" in
+        "信息") echo -e "${BLUE}${timestamp} [${level}] ${message}${NC}" | tee -a "$LOG_FILE" ;;
+        "成功") echo -e "${GREEN}${timestamp} [${level}] ${message}${NC}" | tee -a "$LOG_FILE" ;;
+        "警告") echo -e "${YELLOW}${timestamp} [${level}] ${message}${NC}" | tee -a "$LOG_FILE" ;;
+        "错误") echo -e "${RED}${timestamp} [${level}] ${message}${NC}" | tee -a "$LOG_FILE" ;;
+        *) echo -e "${timestamp} [${level}] ${message}" | tee -a "$LOG_FILE" ;; # 默认无颜色
+    esac
 }
 
 log_info() { log_message "信息" "$1"; }
@@ -135,8 +144,19 @@ get_container_details() {
     else
         log_info "容器 ${container_name} 是一个独立容器。"
         # 尝试生成 docker run 命令
-        run_command=$(docker inspect --format 'docker run {{range .Config.Env}}-e {{. | printf "%q"}} {{end}}{{range .HostConfig.PortBindings}}{{range $p, $a := .}} -p {{$a.HostIp}}:{{$a.HostPort}}:{{$p}} {{end}}{{end}}{{range .HostConfig.Binds}} -v {{. | printf "%q"}} {{end}}{{range .HostConfig.VolumesFrom}} --volumes-from {{.}} {{end}}{{range .HostConfig.Links}} --link {{.}} {{end}}--name {{.Name}} {{.Config.Image}} {{.Config.Cmd | join " "}}' "$container_id" | sed 's|^docker run /|docker run |' | sed 's|^docker run --name|docker run --name /')
-        run_command=$(echo "$run_command" | sed "s| --name /$container_name| --name $container_name|" | sed 's/  */ /g')
+        # 改进：更安全地提取 Cmd 字段，并确保其为字符串格式
+        local cmd_args=$(docker inspect --format '{{json .Config.Cmd}}' "$container_id" 2>/dev/null | jq -r 'if type == "array" then .[] | @sh else . end' | tr '\n' ' ')
+        
+        # 简化 docker run 命令生成，避免复杂 sed 替换
+        run_command="docker run "
+        run_command+=$(docker inspect --format '{{range .Config.Env}}-e {{. | printf "%q"}} {{end}}{{range .HostConfig.PortBindings}}{{range $p, $a := .}} -p {{$a.HostIp}}:{{$a.HostPort}}:{{$p}} {{end}}{{end}}{{range .HostConfig.Binds}} -v {{. | printf "%q"}} {{end}}{{range .HostConfig.VolumesFrom}} --volumes-from {{.}} {{end}}{{range .HostConfig.Links}} --link {{.}} {{end}}' "$container_id" 2>/dev/null)
+        run_command+="--name ${container_name} " # 直接使用清理后的容器名称
+        run_command+=$(docker inspect --format '{{.Config.Image}}' "$container_id" 2>/dev/null)
+        run_command+=" ${cmd_args}"
+        
+        # 移除多余的空格
+        run_command=$(echo "$run_command" | sed 's/  */ /g' | xargs)
+
         echo "DOCKER_RUN_COMMAND=${run_command}" >> "${TMP_DETAILS_FILE}"
     fi
 
@@ -227,8 +247,7 @@ backup_project() {
                 inferred_project_name="$first_container_name"
             else
                 # 如果有多个容器但不是Compose，或者Compose名为空，则使用第一个容器名作为建议
-                # 也可以考虑使用 "multi_container_project" 或让用户输入
-                inferred_project_name="$first_container_name" # 或者 "multi_service_backup"
+                inferred_project_name="$first_container_name"
             fi
         fi
     fi
@@ -330,6 +349,7 @@ backup_project() {
         log_info "正在备份 Docker 命名卷: ${vol_name}"
         local volume_path=$(docker volume inspect --format '{{.Mountpoint}}' "$vol_name" 2>/dev/null)
         if [ -d "$volume_path" ]; then
+            # 确保 tar 命令是在正确的工作目录下运行，以防止生成多余的父目录结构
             tar -czf "${backup_folder}/volume_${vol_name}.tar.gz" -C "$(dirname "$volume_path")" "$(basename "$volume_path")" || log_warn "备份卷数据失败 ${vol_name}。可能为空或正在使用。继续备份。"
         else
             log_warn "未找到卷挂载点 ${vol_name}: ${volume_path}。跳过卷数据备份。继续备份。"
@@ -339,9 +359,9 @@ backup_project() {
     for bind_path in "${bind_mount_paths[@]}"; do
         log_info "正在从宿主机备份绑定挂载数据: ${bind_path}"
         if [ -d "$bind_path" ]; then
-            # 将 / 替换为 _ 以保证文件名安全
-            local safe_bind_path_name=$(echo "$bind_path" | sed 's/\//_/g' | sed 's/^_//' | sed 's/_$//') # 增加去除末尾下划线
-            tar -czf "${backup_folder}/bind_mount_${safe_bind_path_name}.tar.gz" -C "$(dirname "$bind_path")" "$(basename "$bind_path")" || log_warn "备份绑定挂载数据失败 ${bind_path}。可能为空或正在使用。继续备份。"
+            # 使用 base64 编码路径，确保文件名安全且唯一可逆
+            local encoded_bind_path=$(echo -n "$bind_path" | base64 | tr -d '\n' | sed 's/=//g')
+            tar -czf "${backup_folder}/bind_mount_${encoded_bind_path}.tar.gz" -C "$(dirname "$bind_path")" "$(basename "$bind_path")" || log_warn "备份绑定挂载数据失败 ${bind_path}。可能为空或正在使用。继续备份。"
         else
             log_warn "未在宿主机上找到绑定挂载路径: ${bind_path}。跳过绑定挂载数据备份。继续备份。"
         fi
@@ -397,7 +417,7 @@ restore_named_volume() {
 # 恢复绑定挂载
 restore_bind_mount() {
     local backup_file="$1"
-    local host_path="$2"
+    local host_path="$2" # 这是原始的宿主机路径
 
     log_info "正在将绑定挂载数据恢复到宿主机路径: ${host_path} 从 ${backup_file}"
 
@@ -454,10 +474,11 @@ restore_project() {
     done
 
     # 恢复绑定挂载
-    local bind_mount_paths=($(grep "BIND_MOUNT_PATH_ON_HOST=" "$details_file" | cut -d'=' -f2 | sort -u))
-    for bind_path in "${bind_mount_paths[@]}"; do
-        local safe_bind_path_name=$(echo "$bind_path" | sed 's/\//_/g' | sed 's/^_//' | sed 's/_$//')
-        local bind_backup_file="${temp_extract_dir}/bind_mount_${safe_bind_path_name}.tar.gz"
+    local bind_mount_host_paths=($(grep "BIND_MOUNT_PATH_ON_HOST=" "$details_file" | cut -d'=' -f2 | sort -u))
+    for bind_path in "${bind_mount_host_paths[@]}"; do
+        # 解码路径以找到正确的备份文件
+        local encoded_bind_path=$(echo -n "$bind_path" | base64 | tr -d '\n' | sed 's/=//g')
+        local bind_backup_file="${temp_extract_dir}/bind_mount_${encoded_bind_path}.tar.gz"
         if [ -f "$bind_backup_file" ]; then
             restore_bind_mount "$bind_backup_file" "$bind_path" || restore_status="部分成功"
         else
@@ -494,13 +515,14 @@ restore_project() {
     else
         log_info "正在恢复独立 Docker 容器。"
         IFS=$'\n' read -d '' -ra container_blocks < <(awk '/--- CONTAINER_START ---/{flag=1; next} /--- CONTAINER_END ---/{flag=0} flag' "$details_file")
-        for block in "${container_blocks[@]}"; do
-            if [ -z "$block" ]; then continue; fi
+        for block_content in "${container_blocks[@]}"; do
+            if [ -z "$block_content" ]; then continue; fi
 
-            local container_name=$(echo "$block" | grep "CONTAINER_NAME=" | cut -d'=' -f2)
-            local container_image=$(echo "$block" | grep "CONTAINER_IMAGE=" | cut -d'=' -f2)
-            local docker_run_command=$(echo "$block" | grep "DOCKER_RUN_COMMAND=" | cut -d'=' -f2)
-            local restart_policy=$(echo "$block" | grep "CONTAINER_RESTART_POLICY=" | cut -d'=' -f2)
+            # 使用 here-string 将多行内容传递给 grep/cut
+            local container_name=$(echo "$block_content" | grep "CONTAINER_NAME=" | cut -d'=' -f2)
+            local container_image=$(echo "$block_content" | grep "CONTAINER_IMAGE=" | cut -d'=' -f2)
+            local docker_run_command=$(echo "$block_content" | grep "DOCKER_RUN_COMMAND=" | cut -d'=' -f2)
+            local restart_policy=$(echo "$block_content" | grep "CONTAINER_RESTART_POLICY=" | cut -d'=' -f2)
 
             log_info "正在尝试恢复容器: ${container_name} (镜像: ${container_image})"
 
@@ -512,7 +534,8 @@ restore_project() {
                     docker rm "$container_name" &>/dev/null
                 fi
 
-                if [[ ! "$docker_run_command" =~ "--restart " && "$restart_policy" != "no" ]]; then
+                # 确保重启策略被加入到命令中，除非命令已经包含或策略为no
+                if [[ ! "$docker_run_command" =~ "--restart " && "$restart_policy" != "no" && -n "$restart_policy" ]]; then
                     docker_run_command+=" --restart $restart_policy"
                 fi
                 
@@ -520,7 +543,9 @@ restore_project() {
                 log_info "${YELLOW}${docker_run_command}${NC}"
                 read -r -e -p "您想执行此命令吗？(y/N): " exec_confirm
                 if [[ "$exec_confirm" =~ ^[Yy]$ ]]; then
-                    eval "$docker_run_command"
+                    # 运行前再次检查命令中是否有 / 作为名称前缀并移除 (尽管前面生成命令时已处理)
+                    local final_run_command=$(echo "$docker_run_command" | sed "s| --name /${container_name}| --name ${container_name}|")
+                    eval "$final_run_command"
                     if [ $? -eq 0 ]; then
                         log_success "容器 ${container_name} 已重新创建 (查看日志获取详细信息)。"
                     else
@@ -549,31 +574,16 @@ restore_project() {
     echo "" # 添加空行以提高可读性
 }
 
-# --- 菜单功能 ---
-
-show_main_menu() {
-    clear # 清屏以显示干净的菜单
-    echo -e "${GREEN}--- Docker 备份与恢复主菜单 ---${NC}"
-    echo "1. 备份 Docker 服务"
-    echo "2. 恢复 Docker 服务"
-    echo "3. 查看备份/恢复日志"
-    echo "4. 列出可用备份文件"
-    echo "5. 退出"
-    echo -e "${GREEN}-------------------------------${NC}"
-    read -r -e -p "请输入您的选择 (1-5): " choice
-    echo "" # 空行用于间距
-}
-
 # 列出运行的 Docker 服务 (实时获取)
 list_docker_services() {
     log_info "正在获取当前正在运行的 Docker 服务..."
-    echo -e "${BLUE}------------------------------------------------------------------------------------${NC}"
-    echo -e "${YELLOW}序号        ID            名称                 镜像                         状态        Compose项目${NC}"
-    echo -e "${BLUE}------------------------------------------------------------------------------------${NC}"
+    echo -e "${BLUE}-------------------------------------------------------------------------------------------------------${NC}"
+    echo -e "${YELLOW}序号        ID            名称                 镜像                         状态              Compose项目${NC}"
+    echo -e "${BLUE}-------------------------------------------------------------------------------------------------------${NC}"
 
     local services=()
     local i=1
-    # 仅列出正在运行的容器 (不带 -a 参数)
+    # 仅列出正在运行的容器
     while IFS= read -r line; do
         services+=("$line")
         local id=$(echo "$line" | awk '{print $1}')
@@ -582,10 +592,10 @@ list_docker_services() {
         local status=$(echo "$line" | awk '{print $4,$5,$6,$7,$8}') # 修正状态列可能包含空格
         local compose_label=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$id" 2>/dev/null)
         
-        printf "%-8s %-12s %-18s %-28s %-12s %s\n" "$i." "$id" "$name" "$image" "$status" "$compose_label"
+        printf "%-8s %-12s %-18s %-28s %-18s %s\n" "$i." "$id" "$name" "$image" "$status" "$compose_label"
         i=$((i+1))
-    done < <(docker ps --format "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}") # **关键更改: 移除 -a**
-    echo -e "${BLUE}------------------------------------------------------------------------------------${NC}"
+    done < <(docker ps --format "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}") # **只显示运行中的容器**
+    echo -e "${BLUE}-------------------------------------------------------------------------------------------------------${NC}"
 
     if [ ${#services[@]} -eq 0 ]; then
         log_warn "未在此服务器上找到正在运行的 Docker 服务 (容器)。"
@@ -595,10 +605,60 @@ list_docker_services() {
     return 0
 }
 
+# --- 脚本自注册函数 ---
+self_register_as_global_command() {
+    # 检查目标路径是否已存在同名文件，如果存在且不是当前脚本，则提示
+    if [ -f "$GLOBAL_COMMAND_PATH" ]; then
+        if [ "$(readlink -f "$0")" == "$(readlink -f "$GLOBAL_COMMAND_PATH")" ]; then
+            # 已经注册，并且当前运行的就是注册的脚本
+            return 0
+        else
+            log_warn "检测到 '/usr/local/bin/${GLOBAL_COMMAND_NAME}' 已存在，但它不是当前脚本。"
+            log_warn "如果您想将当前脚本注册为 '${GLOBAL_COMMAND_NAME}'，请手动删除旧文件或重命名当前脚本。"
+            return 1
+        fi
+    fi
+
+    echo -e "${YELLOW}检测到这是 DMR 脚本的首次运行或未注册为全局命令。${NC}"
+    echo -e "${BLUE}建议将其注册为全局命令 '${GLOBAL_COMMAND_NAME}'，以便您在任何位置直接运行 'sudo ${GLOBAL_COMMAND_NAME}'。${NC}"
+    read -r -e -p "您想将脚本注册为全局命令吗？(y/N): " register_confirm
+
+    if [[ "$register_confirm" =~ ^[Yy]$ ]]; then
+        # 确保当前脚本有执行权限
+        chmod +x "$0"
+        
+        # 将当前脚本复制到目标路径并重命名
+        sudo cp "$0" "$GLOBAL_COMMAND_PATH"
+        if [ $? -eq 0 ]; then
+            log_success "DMR 脚本已成功注册为全局命令: ${GREEN}sudo ${GLOBAL_COMMAND_NAME}${NC}"
+            log_info "您现在可以退出当前会话并重新登录，或者运行 'hash -r' 使新命令生效。"
+            echo -e "${BLUE}--------------------------------------------------${NC}"
+            echo -e "${BLUE}请注意：现在您可以使用 'sudo ${GLOBAL_COMMAND_NAME}' 来启动脚本。${NC}"
+            echo -e "${BLUE}原脚本文件 '${SCRIPT_NAME}' 可以保留在原处或删除。${NC}"
+            echo -e "${BLUE}--------------------------------------------------${NC}"
+            read -r -e -p "按回车键继续..."
+        else
+            log_error "注册全局命令失败。请检查权限或手动将脚本复制到 '/usr/local/bin' 并重命名为 '${GLOBAL_COMMAND_NAME}'。"
+            log_warn "您仍然可以继续使用当前脚本文件运行 DMR。"
+            read -r -e -p "按回车键继续..."
+        fi
+    else
+        log_info "用户选择不注册为全局命令。您仍然可以使用 '${0}' 路径运行 DMR。"
+        read -r -e -p "按回车键继续..."
+    fi
+}
+
+
 # --- 脚本主逻辑 ---
 
 # 优先创建备份基础目录，确保日志能正常写入
 mkdir -p "${BACKUP_BASE_DIR}" || log_error "无法创建基础目录: ${BACKUP_BASE_DIR}。请检查权限。"
+
+# 执行自注册逻辑
+# 只有当当前脚本不是以 GLOBAL_COMMAND_NAME 运行时才触发注册提示
+if [ "$(basename "$0")" != "${GLOBAL_COMMAND_NAME}" ]; then
+    self_register_as_global_command
+fi
 
 # 预先检查依赖项和 Docker 状态
 check_dependencies
@@ -606,7 +666,16 @@ check_docker_status
 
 
 while true; do
-    show_main_menu
+    clear # 清屏以显示干净的菜单
+    echo -e "${GREEN}--- DMR - Docker 备份与恢复主菜单 ---${NC}"
+    echo "1. 备份 Docker 服务"
+    echo "2. 恢复 Docker 服务"
+    echo "3. 查看备份/恢复日志"
+    echo "4. 列出可用备份文件"
+    echo "5. 退出"
+    echo -e "${GREEN}-------------------------------------${NC}"
+    read -r -e -p "请输入您的选择 (1-5): " choice
+    echo "" # 空行用于间距
 
     case "$choice" in
         1) # 备份 Docker 服务
@@ -616,21 +685,51 @@ while true; do
                 # 如果没有正在运行的服务，此处不直接返回主菜单，允许用户手动输入
                 log_warn "没有正在运行的 Docker 服务列出。您仍然可以手动输入容器 ID/名称或镜像名称进行备份。"
             fi
+            echo ""
             echo -e "${YELLOW}0. 返回主菜单${NC}"
-            read -r -e -p "请输入要备份的 Docker 镜像名称或容器 ID/名称 (例如: 'nginx:latest' 或 'my_app_container'): " service_identifier
-            if [ "$service_identifier" == "0" ]; then
+            echo -e "${BLUE}提示：您可以输入一个或多个服务标识符，用空格 ' ' 分隔进行批量备份。${NC}"
+            read -r -e -p "请输入要备份的 Docker 镜像名称或容器 ID/名称 (例如: 'nginx:latest my_app_container'): " service_identifiers_input
+            
+            if [ "$service_identifiers_input" == "0" ]; then
                 log_info "返回主菜单。"
                 continue
             fi
-            if [ -z "$service_identifier" ]; then
+            if [ -z "$service_identifiers_input" ]; then
                 log_warn "未提供服务标识符。返回主菜单。"
                 continue
             fi
-            read -r -e -p "确认备份 '${service_identifier}' 吗？(y/N): " confirm_backup
+
+            # **修复：将 services_to_backup 声明为局部变量提升到函数开始，或者移除这里的local**
+            # 为了在此作用域中使用，直接赋值即可，无需local
+            IFS=' ' read -ra identifiers_array <<< "$service_identifiers_input"
+            
+            # 声明为局部变量，确保其作用域仅限于此case块
+            local services_to_backup=() 
+            for id_input in "${identifiers_array[@]}"; do
+                # 清理前后空格
+                clean_id=$(echo "$id_input" | xargs)
+                if [ -n "$clean_id" ]; then
+                    services_to_backup+=("$clean_id")
+                fi
+            done
+
+            if [ ${#services_to_backup[@]} -eq 0 ]; then
+                log_warn "没有检测到有效的服务标识符。返回主菜单。"
+                continue
+            fi
+
+            echo ""
+            echo -e "${BLUE}您选择了以下服务进行备份: ${YELLOW}${services_to_backup[*]}${NC}"
+            read -r -e -p "确认开始备份这些服务吗？(y/N): " confirm_backup
             if [[ "$confirm_backup" =~ ^[Yy]$ ]]; then
-                backup_project "$service_identifier"
+                for service_id in "${services_to_backup[@]}"; do
+                    log_info "--- 正在备份服务: ${service_id} ---"
+                    backup_project "$service_id" # 调用现有的备份函数
+                    echo "" # 每个服务备份后添加空行
+                done
+                log_success "所有选定服务的批量备份操作已完成。"
             else
-                log_info "用户取消备份。"
+                log_info "用户取消批量备份。"
             fi
             read -r -e -p "按回车键返回主菜单..."
             ;;
@@ -656,11 +755,11 @@ while true; do
                 filename=$(basename "$file_path")
                 # 从文件名中解析日期、时间和项目名称
                 # 文件名示例: docker_project_backup_20250725_102100_my_web_app.tar.gz 或 docker_project_backup_20250725_102100_my_web_app_1.tar.gz
-                datetime_part=$(echo "$filename" | sed -n "s/^${BACKUP_FILE_PREFIX}_\([0-9]\{8\}_[0-9]\{6\}\)_.*$/\1/p")
+                datetime_part=$(echo "$filename" | sed -n "s/^${BACKUP_FILE_PREFIX}_\([0-9]\{8\}\_[0-9]\{6\}\)_.*$/\1/p")
                 file_date=$(echo "$datetime_part" | cut -d'_' -f1)
                 file_time=$(echo "$datetime_part" | cut -d'_' -f2)
                 # 提取项目名部分，考虑可能包含的数字后缀
-                project_part=$(echo "$filename" | sed -n "s/^${BACKUP_FILE_PREFIX}_[0-9]\{8\}_[0-9]\{6\}_\(.*\)\.tar\.gz$/\1/p")
+                project_part=$(echo "$filename" | sed -n "s/^${BACKUP_FILE_PREFIX}_[0-9]\{8\}\_[0-9]\{6\}_\(.*\)\.tar\.gz$/\1/p")
 
                 printf "%-8s %-10s %-8s %-35s %s\n" "$file_size" "$file_date" "$file_time" "$project_part" "$filename"
             done
