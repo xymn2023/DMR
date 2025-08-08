@@ -53,6 +53,13 @@ DMR 的目标是提供一个用户友好的菜单驱动界面，让 Docker 项�
 
 ## 如何使用
 
+**一键命令**
+
+```
+curl -fsSL https://raw.githubusercontent.com/xymn2023/DMR/main/docker_back.sh -o docker_back.sh && chmod +x docker_back.sh && ./docker_back.sh
+```
+
+
 
 
 1. 下载脚本：
@@ -107,4 +114,5 @@ DMR 的目标是提供一个用户友好的菜单驱动界面，让 Docker 项�
 DMR 旨在成为一个实用且易于使用的工具。如果您有任何功能建议、优化意见或遇到问题，欢迎提出。您的反馈是改进 DMR 的最大动力。
 
 ------
+
 
