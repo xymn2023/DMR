@@ -111,11 +111,24 @@ curl -fsSL https://raw.githubusercontent.com/xymn2023/DMR/main/docker_back.sh -o
 
 ### 贡献与反馈
 
-
-
 DMR 旨在成为一个实用且易于使用的工具。如果您有任何功能建议、优化意见或遇到问题，欢迎提出。您的反馈是改进 DMR 的最大动力。
 
+
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=xymn2023/DMR&type=Timeline)](https://www.star-history.com/#xymn2023/DMR&Timeline)
+
+
+
+
+
+
+
+
+
 ------
+
 
 
 
